@@ -5,7 +5,7 @@
     "m_list": "32,64,128,256,512",
     "sigma": 0.5,
     "sigma_mode": "median",
-    "bandwidth": "median",
+    "bandwidth": "median_mmd",
     "whiten": 0,
     "whiten_bandwidth": "sqrt_d",
     "sigma_n_sample": 4000,

@@ -92,10 +92,11 @@ class VSPDDPMSampler:
         try:
             torch.set_default_dtype(torch.float32)
             for obs in y:
+                # Use the same observation y for all n DDPM samples.
                 cond = obs.unsqueeze(0).expand(n, -1)
                 samples.append(self.model.sample(
                     cond, n_steps=self.n_steps, generator=g
-                ).cpu())
+                ).cpu())  # Move samples to CPU for QField.
         finally:
             torch.set_default_dtype(previous_dtype)
 
@@ -133,7 +134,8 @@ class DQVSP:
         dev = "cuda" if (int(args.gpu_id) >= 0 and torch.cuda.is_available()
                          and torch.cuda.mem_get_info()[0] / 1e9 > 1.0) else "cpu"
         self.flow_dev = dev
-        # Load the pretrained DDPM before switching QField to float64.
+        # DDPM uses float32, but I keep QField in float64 for the MMD calculations.
+        # Load DDPM first so changing the default dtype does not affect it.
         self.sampler = VSPDDPMSampler(dev, n_steps=int(args.ddim_steps))
         torch.set_default_dtype(DTYPE)
 
@@ -164,8 +166,15 @@ class DQVSP:
             self.depths = f["depths"][:]
             self.attrs = dict(f.attrs)
 
+        # Normalize y using the normalizer from the DDPM checkpoint.
         self.y_tr = self.sampler.normalize(self.y_tr_raw)
         self.y_ev = self.sampler.normalize(self.y_ev_raw)
+
+        # Check that the data dimensions match the pretrained DDPM.
+        assert self.d == 41 and self.dy == 20
+        assert self.y_tr.shape[-1] == self.dy
+        assert self.y_ev.shape[-1] == self.dy
+        assert self.xi_true_ev.shape[-1] == self.d
 
         print(
             f"[vsp] DDPM on {dev} | d={self.d} dy={self.dy} "
@@ -175,7 +184,7 @@ class DQVSP:
 
     # ---- bandwidth -------------------------------------------------------
     def _sigma(self) -> float:
-        """Pooled median heuristic over flow samples across training obs."""
+        """Median heuristic using DDPM samples from training observations."""
         a = self.args
         g = torch.Generator().manual_seed(int(a.base_seed) + 1234)
         n_obs = min(64, self.y_tr.shape[0])
@@ -185,7 +194,7 @@ class DQVSP:
         ).reshape(-1, self.d)[: int(a.sigma_n_sample)]
         sig = math.sqrt(median_heuristic_sigma_sq(draws.double().cpu()))
         print(f"[sigma] pooled median heuristic (mmd rule) over "
-              f"{draws.shape[0]} flow draws: {sig:.4f}", flush=True)
+              f"{draws.shape[0]} DDPM draws: {sig:.4f}", flush=True)
         return float(sig)
 
     def _build_net(self) -> ConditionalQuadratureAmortizer:
@@ -202,7 +211,7 @@ class DQVSP:
 
     def _draw(self, y_std_rows: torch.Tensor, n: int,
               gen: torch.Generator) -> torch.Tensor:
-        """Flow samples ``(n_obs, n, d)`` in float64 on CPU."""
+        """DDPM samples ``(n_obs, n, d)`` in float64 on CPU."""
         return self.sampler.draw(y_std_rows, n, gen)
 
     # ---- training (on-the-fly reference) ---------------------------------
@@ -261,7 +270,7 @@ class DQVSP:
             obs = obs[: int(a.batch_obs)]
             y_b = self.y_tr[obs]
             # Fresh reference every step: M seeds plus an n_mu estimand bank
-            # per observation, both from the flow (no fixed atoms to memorize).
+            # per observation, both sampled from the DDPM.
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             sampling_start = time.perf_counter()
             allv = self._draw(y_b, M + n_mu, gen)
@@ -269,6 +278,8 @@ class DQVSP:
             sampling_times.append(time.perf_counter() - sampling_start)
             training_start = time.perf_counter()
             z0, bank = allv[:, :M], allv[:, M:]
+            # Pass both the DDPM samples and y to QField.
+            # For now I keep QField on CPU.
             z = net(z0, y_b.double().cpu())
             # mu_hat over the per-step bank; c_rho drops (net-independent).
             sq = torch.cdist(z, bank) ** 2
@@ -379,7 +390,9 @@ class DQVSP:
         rep = int(a.eval_repeats)
         rows = []
         y_cpu = self.y_ev.double().cpu()
-        perm = torch.roll(torch.arange(self.y_ev.shape[0]), 7)
+        # Shuffle y to check if QField is actually using the conditioning.
+        assert self.y_ev.shape[0] >= 2
+        perm = torch.roll(torch.arange(self.y_ev.shape[0]), shifts=1)
         y_const = y_cpu.mean(dim=0)
         ctrl = None
         for M in self.m_list:
@@ -398,6 +411,7 @@ class DQVSP:
                     int(a.base_seed) + 50_000 + 1000 * int(M) + o)
                 gB = torch.Generator().manual_seed(
                     int(a.base_seed) + 350_000 + 1000 * int(M) + o)
+                # Use bank A for fitting and bank B for evaluation.
                 tgtA, bankA = self._eval_target(o, gA, L)
                 tgtB, bankB = self._eval_target(o, gB, L)
                 inv2s = 1.0 / (2.0 * self.sigma ** 2)

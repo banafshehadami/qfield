@@ -96,7 +96,7 @@ class VSPDDPMSampler:
                 cond = obs.unsqueeze(0).expand(n, -1)
                 samples.append(self.model.sample(
                     cond, n_steps=self.n_steps, generator=g
-                ).cpu())  # Move samples to CPU for QField.
+                ))
         finally:
             torch.set_default_dtype(previous_dtype)
 
@@ -211,7 +211,7 @@ class DQVSP:
 
     def _draw(self, y_std_rows: torch.Tensor, n: int,
               gen: torch.Generator) -> torch.Tensor:
-        """DDPM samples ``(n_obs, n, d)`` in float64 on CPU."""
+        """DDPM samples ``(n_obs, n, d)`` in float64 on sampler device."""
         return self.sampler.draw(y_std_rows, n, gen)
 
     # ---- training (on-the-fly reference) ---------------------------------
@@ -220,13 +220,12 @@ class DQVSP:
         self.sigma = self._sigma()
         inv2s = 1.0 / (2.0 * self.sigma ** 2)
         torch.manual_seed(int(a.seed))
-        net = self._build_net()
+        net = self._build_net().to(self.flow_dev)
         n_par = sum(p.numel() for p in net.parameters())
         print(f"[net] vector-conditioned amortizer, params {n_par:,}",
               flush=True)
         opt = torch.optim.Adam(net.parameters(), lr=float(a.lr))
         gen = torch.Generator().manual_seed(int(a.base_seed) + 7)
-        m_choices = torch.tensor(self.m_list)
         n_mu = int(a.n_mu_train)
         # Held-out validation family: whole observations, never seen by the
         # trainer, scored on the same objective at a fixed generator every
@@ -247,8 +246,8 @@ class DQVSP:
                     n_val_bank = 48 if int(a.n_steps) <= 10 else 1024
                     av = self._draw(yb, n_val_nodes + n_val_bank, gv)
                     zv, bv = av[:, :n_val_nodes], av[:, n_val_nodes:]
-                    zv = net(zv, yb.double().cpu())
-                    sq = torch.cdist(zv, bv) ** 2
+                    zv = net(zv.to(self.flow_dev), yb.to(self.flow_dev, dtype=DTYPE))
+                    sq = torch.cdist(zv, bv.to(self.flow_dev)) ** 2
                     muv = torch.exp(-sq * inv2s).mean(-1)
                     wv = constrained_weights_batched(zv, muv, self.sigma,
                                                      a.jitter)
@@ -263,9 +262,16 @@ class DQVSP:
         t0 = time.time()
         net.train()
         sampling_times, training_times = [], []
+        benchmark_by_m = {
+            int(m): {"sampling": [], "gradient": [], "training": []}
+            for m in self.m_list
+        }
+        # Balanced M schedule for reproducible GPU benchmarks.
+        # Each M is measured equally often.
+        # Reserve 5 warm-up iterations per M when enough steps are available.
+        warmup_per_m = 5 if int(a.n_steps) >= 5 * len(self.m_list) else 0
         for step in range(int(a.n_steps)):
-            M = int(m_choices[torch.randint(len(m_choices), (1,),
-                                            generator=gen)])
+            M = int(self.m_list[step % len(self.m_list)])
             obs = torch.randperm(self.y_tr.shape[0], generator=gen)
             obs = obs[: int(a.batch_obs)]
             y_b = self.y_tr[obs]
@@ -276,13 +282,15 @@ class DQVSP:
             allv = self._draw(y_b, M + n_mu, gen)
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             sampling_times.append(time.perf_counter() - sampling_start)
+            if step >= warmup_per_m * len(self.m_list):
+                benchmark_by_m[M]["sampling"].append(sampling_times[-1])
             training_start = time.perf_counter()
             z0, bank = allv[:, :M], allv[:, M:]
             # Pass both the DDPM samples and y to QField.
-            # For now I keep QField on CPU.
-            z = net(z0, y_b.double().cpu())
+            # DDPM samples and QField training remain on GPU.
+            z = net(z0.to(self.flow_dev), y_b.to(self.flow_dev, dtype=DTYPE))
             # mu_hat over the per-step bank; c_rho drops (net-independent).
-            sq = torch.cdist(z, bank) ** 2
+            sq = torch.cdist(z, bank.to(self.flow_dev)) ** 2
             mu = torch.exp(-sq * inv2s).mean(dim=-1)          # (B, M)
             w = constrained_weights_batched(z, mu, self.sigma, a.jitter)
             gram = torch.exp(-(torch.cdist(z, z) ** 2) * inv2s)
@@ -291,10 +299,22 @@ class DQVSP:
                 - 2.0 * torch.einsum("bi,bi->b", w, mu)
             ).mean()
             opt.zero_grad()
+
+            if self.flow_dev == 'cuda': torch.cuda.synchronize()
+            gradient_start = time.perf_counter()
             loss.backward()
+            if self.flow_dev == 'cuda': torch.cuda.synchronize()
+            gradient_time = time.perf_counter() - gradient_start
+
+            if step >= warmup_per_m * len(self.m_list):
+                benchmark_by_m[M]["gradient"].append(gradient_time)
+
             opt.step()
             torch.cuda.synchronize() if torch.cuda.is_available() else None
+
             training_times.append(time.perf_counter() - training_start)
+            if step >= warmup_per_m * len(self.m_list):
+                benchmark_by_m[M]["training"].append(training_times[-1])
             v = float(loss.detach())
             ema = v if ema is None else 0.98 * ema + 0.02 * v
             if step % log_every == 0 or step == int(a.n_steps) - 1:
@@ -315,7 +335,7 @@ class DQVSP:
                                net.state_dict().items()}
                 else:
                     n_stale += 1
-                    if n_stale >= patience:
+                    if n_stale >= patience and warmup_per_m == 0:
                         print(f"[early stop] val stale {n_stale}x at step "
                               f"{step}; best {best_val:.4e} restored",
                               flush=True)
@@ -323,13 +343,88 @@ class DQVSP:
         print(f"[benchmark] Training loop wall: {time.time()-t0:.3f} s")
         print(f"[benchmark] DDPM sampling: {sum(sampling_times)/len(sampling_times)*1000:.2f} ms/step")
         print(f"[benchmark] QField training: {sum(training_times)/len(training_times)*1000:.2f} ms/step")
+        print(f"[benchmark] Warm-up excluded: {warmup_per_m} per M")
+        print("\n========== VSP BENCHMARK BY M ==========")
+        print(
+            f"{'M':>6} {'N':>6} "
+            f"{'DDPM (ms)':>14} "
+            f"{'Gradient (ms)':>16} "
+            f"{'QField step (ms)':>18}"
+        )
+
+        for M in sorted(benchmark_by_m):
+            results = benchmark_by_m[M]
+            n = len(results["sampling"])
+
+            if n == 0:
+                continue
+
+            sampling_ms = 1000 * sum(results["sampling"]) / n
+            gradient_ms = 1000 * sum(results["gradient"]) / n
+            training_ms = 1000 * sum(results["training"]) / n
+
+            print(
+                f"{M:>6} {n:>6} "
+                f"{sampling_ms:>14.2f} "
+                f"{gradient_ms:>16.2f} "
+                f"{training_ms:>18.2f}"
+            )
+
+        print("========================================\n")
+        # ------------------------------------------------------------
+        # VSP benchmark visualization: DDPM sampling vs QField gradient
+        # ------------------------------------------------------------
+        ms = sorted(
+            M for M, r in benchmark_by_m.items()
+            if len(r["sampling"]) > 0
+        )
+
+        ddpm_ms = [
+            1000 * np.mean(benchmark_by_m[M]["sampling"])
+            for M in ms
+        ]
+        grad_ms = [
+            1000 * np.mean(benchmark_by_m[M]["gradient"])
+            for M in ms
+        ]
+
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.plot(ms, ddpm_ms, "o-", linewidth=2,
+                label="DDPM posterior sampling")
+        ax.plot(ms, grad_ms, "s-", linewidth=2,
+                label="QField gradient calculation")
+
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(ms)
+        ax.set_xticklabels([str(M) for M in ms])
+        ax.set_xlabel("Node budget M")
+        ax.set_ylabel("Mean time per iteration (ms)")
+        ax.set_title("VSP: Posterior Sampling vs QField Gradient")
+        ax.legend()
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+
+        # Save timing benchmark plots alongside the experiment results.
+        from pathlib import Path
+
+        timing_dir = Path("plots") / "vsp_benchmark"
+        timing_dir.mkdir(parents=True, exist_ok=True)
+
+        fig.savefig(timing_dir / "dq_vsp_gpu_timing_vs_M.png",
+                    dpi=200, bbox_inches="tight")
+        fig.savefig(timing_dir / "dq_vsp_gpu_timing_vs_M.pdf",
+                    bbox_inches="tight")
+
+        print(f"[benchmark] Timing plots saved to {timing_dir}")
+        plt.close(fig)
+
+
         if best_sd is not None:
             net.load_state_dict(best_sd)
         print(f"[train] wall {((time.time() - t0) / 60):.1f} min", flush=True)
 
         net.eval()
         rows, nulls, ctrl = self._evaluate(net)
-        # VSP smoke test: Darcy-specific diagnostics are disabled.
         recon = None
         pcn = None
         results = {
@@ -367,7 +462,7 @@ class DQVSP:
         fraction of the reading at the largest budgets.
         """
         L = int(self.args.bank_L) if L is None else int(L)
-        bank = self._draw(self.y_ev[o : o + 1], L, gen)[0]
+        bank = self._draw(self.y_ev[o : o + 1], L, gen)[0].cpu()
         return sampled_bank_target(
             bank, self.sigma, name="vsp_ddpm", dtype=DTYPE, replace=True
         ), bank
@@ -441,17 +536,16 @@ class DQVSP:
                     rA = float(mmd_sq(zu, w_c, muA_u, tgtA.c_rho, self.sigma))
                     cnd = y_cpu[o].unsqueeze(0)
                     with torch.no_grad():
-                        z_n = net(zu.unsqueeze(0), cnd)[0]
+                        z_n = net(zu.unsqueeze(0).to(self.flow_dev), cnd.to(self.flow_dev))[0].cpu()
                         mu_n = tgtA.mu_fn(z_n)
                         w_n = constrained_weights(z_n, mu_n, self.sigma,
                                                   a.jitter)
                         vA = float(mmd_sq(z_n, w_n, mu_n, tgtA.c_rho,
                                           self.sigma))
-                        z_s = net(zu.unsqueeze(0),
-                                  y_cpu[perm[o]].unsqueeze(0))[0]
+                        z_s = net(zu.unsqueeze(0).to(self.flow_dev), y_cpu[perm[o]].unsqueeze(0).to(self.flow_dev))[0].cpu()
                         w_s = constrained_weights(
                             z_s, tgtA.mu_fn(z_s), self.sigma, a.jitter)
-                        z_k = net(zu.unsqueeze(0), y_const.unsqueeze(0))[0]
+                        z_k = net(zu.unsqueeze(0).to(self.flow_dev), y_const.unsqueeze(0).to(self.flow_dev))[0].cpu()
                         w_k = constrained_weights(
                             z_k, tgtA.mu_fn(z_k), self.sigma, a.jitter)
                     sel = select_emission(
@@ -596,8 +690,8 @@ class DQVSP:
             print(f"Saved to {p}")
         plt.close(fig)
 
-        # VSP smoke test: reconstruction visualization is not yet implemented.
         print("[vsp] MMD visualization complete.", flush=True)
+
 
 
 if __name__ == "__main__":
@@ -613,5 +707,4 @@ if __name__ == "__main__":
         exp.train()
     exp.load_checkpoint()
     exp.visualize()
-    if args.upload:
-        upload_to_cloud(args)
+

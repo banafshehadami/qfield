@@ -1,5 +1,6 @@
 {
-  "experiment_name": "dq_vsp_200000",
+  "experiment_name": "dq_vsp_100kv2",
+  "n_steps": 100000,
   "d": 41,
   "dy": 20,
   "m_list": "32,64,128,256,512",
@@ -20,7 +21,6 @@
   "cond_n_tokens": 8,
   "delta_scale": 0.5,
   "batch_obs": 16,
-  "n_steps": 200000,
   "eval_repeats": 32,
   "n_pcn_audit": 8,
   "recon_M": 64,

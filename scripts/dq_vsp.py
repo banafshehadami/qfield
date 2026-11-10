@@ -8,9 +8,11 @@ set-equivariant network is trained once across observations; at any held-out
 signed-weight quadrature of ``rho_y``, and the safeguarded selection is never
 worse than the seeds it was handed.
 
-Setup: ambient ``d = 41`` (the N(0, I) LayeredPrior unknowns); training
-samples the DDPM on the fly (a fresh per-observation bank every step, so there
-is no fixed atom set to memorize, and ``c_rho`` leaves the gradient); at
+Setup: ambient ``d = 41`` (the N(0, I) LayeredPrior unknowns); training and
+validation draw from a pregenerated bank of DDPM samples
+(``data/vsp_posterior_train_51200.h5``: 2560 samples per training
+observation, made by generate_vsp_posterior_dataset.py with the same DDPM), a
+random subset every step; ``c_rho`` leaves the gradient. At
 evaluation ``rho_y`` is defined as an ``L = 8192``-atom DDPM bank, so
 ``mu_rho`` / ``c_rho`` are exact for it, seeds are sampled with replacement
 (``replace=True``; without it the floor deflates by exactly ``(L-M)/(L-1)``),
@@ -28,8 +30,9 @@ what conditioning buys. (Darcy's pCN audit is Darcy-specific and not ported.)
 Split: training observations from the DDPM's own train rows, evaluation from
 fresh simulator observations, so evaluation ``y`` is new to both networks.
 
-Compute split: DDPM sampling float32 on the GPU (falls back to CPU), all
-quadrature algebra float64 on CPU.
+Compute split: DDPM sampling float32 on the GPU (falls back to CPU); the
+training and validation quadrature algebra float64 on the same device (for
+speed); evaluation float64 on CPU, as in Darcy.
 
 Train (build, train, evaluate, render):
     python scripts/dq_vsp.py --experiment_name dq_vsp
@@ -63,6 +66,7 @@ from tqdm import tqdm  # noqa: E402
 from _figstyle import apply_house_style, despine  # noqa: E402
 
 import h5py  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 from qfield.designed_quadrature import (  # noqa: E402
     constrained_weights,
@@ -84,6 +88,8 @@ from vspsampling.download import REPO as VSP_ROOT  # noqa: E402
 from vspsampling.models.conditional_ddpm import ConditionalDDPM  # noqa: E402
 
 CONFIG_FILE = "dq_vsp.json"
+BANK_FILE = (Path(__file__).resolve().parents[1] / "data"
+             / "vsp_posterior_train_51200.h5")
 DTYPE = torch.float64
 torch.set_num_threads(4)
 
@@ -164,18 +170,20 @@ class DQVSP:
         print(f"[ddpm] {VSP_DDPM} on {dev} | d={self.d} dy={self.dy}",
               flush=True)
         assert (self.d, self.dy) == (41, 20)
-        # Observations: the DDPM's own split -- train rows (split 0) for
-        # training, fresh simulator draws for eval, so eval y is new to both
-        # networks.
+        # Observations: training y and their posterior samples come from the
+        # pregenerated bank (rows of the DDPM's train split, seed +41); eval y
+        # are fresh simulator draws, so eval y is new to both networks.
+        with h5py.File(BANK_FILE, "r") as f:
+            bank_idx = f["indices"][:]
+            self.y_tr = torch.as_tensor(f["y_normalized"][:],
+                                        dtype=torch.float32)
+            self.bank_size = int(f["posterior_samples"].shape[1])
+            assert int(f.attrs["ddim_steps"]) == int(args.ddim_steps)
+            assert "completed" not in f or bool(np.all(f["completed"][:]))
         with h5py.File(os.path.join(VSP_ROOT, VSP_DATASET), "r") as f:
             split = f["split"][:]
-            y_all = torch.as_tensor(f["y"][:], dtype=torch.float32)
             self.attrs = {k: f.attrs[k] for k in f.attrs}
-        gen = torch.Generator().manual_seed(int(args.base_seed) + 41)
-        tr_rows = torch.as_tensor(np.flatnonzero(split == 0))
-        tr_idx = tr_rows[torch.randperm(len(tr_rows), generator=gen)]
-        tr_idx = tr_idx[: int(args.n_train_obs)]
-        self.y_tr_raw = y_all[tr_idx]
+        assert np.all(split[bank_idx] == 0), "bank rows must be train rows"
         # Eval observations are fresh simulator samples, not the DDPM's eval
         # rows: those rows early-stopped the DDPM, so scoring on them inherits
         # a selection optimism.
@@ -192,8 +200,9 @@ class DQVSP:
         )
         self.y_ev_raw = torch.as_tensor(y_ev, dtype=torch.float32)
         self.xi_true_ev = torch.as_tensor(xi_ev, dtype=torch.float32)
-        self.y_tr = self.ddpm.normalize(self.y_tr_raw)
         self.y_ev = self.ddpm.normalize(self.y_ev_raw)
+        print(f"[bank] {BANK_FILE} | train obs={len(self.y_tr)} "
+              f"samples/obs={self.bank_size}", flush=True)
 
     # ---- bandwidth -------------------------------------------------------
     def _sigma(self) -> float:
@@ -202,11 +211,11 @@ class DQVSP:
         g = torch.Generator().manual_seed(int(a.base_seed) + 1234)
         n_obs = min(64, self.y_tr.shape[0])
         per = max(2, int(a.sigma_n_sample) // n_obs)
-        draws = self._draw(self.y_tr[:n_obs], per, g).reshape(
+        draws = self._bank(torch.arange(n_obs), per, g).reshape(
             -1, self.d)[: int(a.sigma_n_sample)]
         sig = math.sqrt(median_heuristic_sigma_sq(draws.double().cpu()))
         print(f"[sigma] pooled median heuristic (mmd rule) over "
-              f"{draws.shape[0]} DDPM draws: {sig:.4f}", flush=True)
+              f"{draws.shape[0]} bank draws: {sig:.4f}", flush=True)
         return float(sig)
 
     def _build_net(self) -> ConditionalQuadratureAmortizer:
@@ -226,13 +235,27 @@ class DQVSP:
         """DDPM samples ``(n_obs, n, d)`` in float64 on CPU."""
         return self.ddpm.sample(y_std_rows, n, gen).double().cpu()
 
+    def _bank(self, rows: torch.Tensor, n: int,
+              gen: torch.Generator) -> torch.Tensor:
+        """``n`` random stored samples per bank row, ``(len(rows), n, d)``
+        float64 on CPU (h5py reads need sorted indices)."""
+        out = []
+        with h5py.File(BANK_FILE, "r") as f:
+            ds = f["posterior_samples"]
+            for r in rows.tolist():
+                pick = torch.randperm(self.bank_size, generator=gen)[:int(n)]
+                order = torch.argsort(pick)
+                block = torch.as_tensor(ds[int(r), pick[order].numpy(), :])
+                out.append(block[torch.argsort(order)])
+        return torch.stack(out).double()
+
     # ---- training (on-the-fly reference) ---------------------------------
     def train(self):
         a = self.args
         self.sigma = self._sigma()
         inv2s = 1.0 / (2.0 * self.sigma ** 2)
         torch.manual_seed(int(a.seed))
-        net = self._build_net()
+        net = self._build_net().to(self.flow_dev)
         n_par = sum(p.numel() for p in net.parameters())
         print(f"[net] vector-conditioned amortizer, params {n_par:,}",
               flush=True)
@@ -244,19 +267,23 @@ class DQVSP:
         # trainer, scored on the same objective at a fixed generator every
         # val_every steps. Early stop on validation, patience 8.
         n_vf = min(64, self.y_tr.shape[0] // 8)
+        rows = torch.arange(self.y_tr.shape[0])
+        val_rows, tr_rows = rows[-n_vf:], rows[:-n_vf]
         y_val = self.y_tr[-n_vf:]
         self.y_tr = self.y_tr[:-n_vf]
         val_every, patience = 200, int(getattr(a, "patience", 8))
         best_val, n_stale, best_sd = float("inf"), 0, None
+
         def _val() -> float:
             gv = torch.Generator().manual_seed(int(a.base_seed) + 55)
             tot = 0.0
             with torch.no_grad():
                 for j in range(0, n_vf, 8):
                     yb = y_val[j : j + 8]
-                    av = self._draw(yb, 128 + 1024, gv)
-                    zv, bv = av[:, :128], av[:, 128:]
-                    zv = net(zv, yb.double().cpu())
+                    av = self._bank(val_rows[j : j + 8], 128 + 1024, gv)
+                    zv = av[:, :128].to(self.flow_dev)
+                    bv = av[:, 128:].to(self.flow_dev)
+                    zv = net(zv, yb.double().to(self.flow_dev))
                     sq = torch.cdist(zv, bv) ** 2
                     muv = torch.exp(-sq * inv2s).mean(-1)
                     wv = constrained_weights_batched(zv, muv, self.sigma,
@@ -277,11 +304,12 @@ class DQVSP:
             obs = torch.randperm(self.y_tr.shape[0], generator=gen)
             obs = obs[: int(a.batch_obs)]
             y_b = self.y_tr[obs]
-            # Fresh reference every step: M seeds plus an n_mu estimand bank
-            # per observation, both from the DDPM (no fixed atoms to memorize).
-            allv = self._draw(y_b, M + n_mu, gen)
-            z0, bank = allv[:, :M], allv[:, M:]
-            z = net(z0, y_b.double().cpu())
+            # Every step: M seeds plus an n_mu estimand bank per observation,
+            # a fresh random subset of that observation's stored samples.
+            allv = self._bank(tr_rows[obs], M + n_mu, gen)
+            z0 = allv[:, :M].to(self.flow_dev)
+            bank = allv[:, M:].to(self.flow_dev)
+            z = net(z0, y_b.double().to(self.flow_dev))
             # mu_hat over the per-step bank; c_rho drops (net-independent).
             sq = torch.cdist(z, bank) ** 2
             mu = torch.exp(-sq * inv2s).mean(dim=-1)          # (B, M)
@@ -329,7 +357,7 @@ class DQVSP:
             net.load_state_dict(best_sd)
         print(f"[train] wall {((time.time() - t0) / 60):.1f} min", flush=True)
 
-        net.eval()
+        net = net.cpu().eval()  # evaluation on CPU, as in Darcy
         rows, nulls, ctrl = self._evaluate(net)
         recon = self._recon(net)
         results = {

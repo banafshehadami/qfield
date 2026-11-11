@@ -1,4 +1,3 @@
-
 """Generate a resumable HDF5 posterior-sample bank for VSP."""
 
 from pathlib import Path
@@ -10,7 +9,7 @@ import numpy as np
 import torch
 
 from vspsampling.download import DATASET, REPO
-from dq_vsp import VSPDDPMSampler
+from dq_vsp import VSPDDPM
 
 
 BASE_SEED = 20260612
@@ -63,10 +62,7 @@ def generate(
     print(f"Selected {len(selected)} training observations")
 
     # Load Ali's pretrained DDPM through the existing sampler.
-    sampler = VSPDDPMSampler(
-        device,
-        n_steps=ddim_steps,
-    )
+    sampler = VSPDDPM(device, ddim_steps)
 
     y_normalized = sampler.normalize(
         torch.from_numpy(y_raw)
@@ -165,7 +161,7 @@ def generate(
             )
 
             with torch.no_grad():
-                samples = sampler.draw(
+                samples = sampler.sample(
                     observation,
                     samples_per_obs,
                     generator,
